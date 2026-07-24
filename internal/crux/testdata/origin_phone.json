@@ -1,0 +1,54 @@
+{
+  "record": {
+    "key": {
+      "formFactor": "PHONE",
+      "origin": "https://example.com"
+    },
+    "metrics": {
+      "largest_contentful_paint": {
+        "histogram": [
+          { "start": 0, "end": 2500, "density": 0.7000 },
+          { "start": 2500, "end": 4000, "density": 0.2200 },
+          { "start": 4000, "density": 0.0800 }
+        ],
+        "percentiles": { "p75": 2600 }
+      },
+      "interaction_to_next_paint": {
+        "histogram": [
+          { "start": 0, "end": 200, "density": 0.9100 },
+          { "start": 200, "end": 500, "density": 0.0700 },
+          { "start": 500, "density": 0.0200 }
+        ],
+        "percentiles": { "p75": 180 }
+      },
+      "cumulative_layout_shift": {
+        "histogram": [
+          { "start": "0.00", "end": "0.10", "density": 0.9300 },
+          { "start": "0.10", "end": "0.25", "density": 0.0500 },
+          { "start": "0.25", "density": 0.0200 }
+        ],
+        "percentiles": { "p75": "0.08" }
+      },
+      "first_contentful_paint": {
+        "histogram": [
+          { "start": 0, "end": 1800, "density": 0.8000 },
+          { "start": 1800, "end": 3000, "density": 0.1500 },
+          { "start": 3000, "density": 0.0500 }
+        ],
+        "percentiles": { "p75": 1700 }
+      },
+      "experimental_time_to_first_byte": {
+        "histogram": [
+          { "start": 0, "end": 800, "density": 0.7800 },
+          { "start": 800, "end": 1800, "density": 0.1800 },
+          { "start": 1800, "density": 0.0400 }
+        ],
+        "percentiles": { "p75": 720 }
+      }
+    },
+    "collectionPeriod": {
+      "firstDate": { "year": 2024, "month": 5, "day": 26 },
+      "lastDate": { "year": 2024, "month": 6, "day": 22 }
+    }
+  }
+}

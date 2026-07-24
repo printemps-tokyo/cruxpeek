@@ -1,0 +1,35 @@
+{
+  "record": {
+    "key": {
+      "url": "https://example.com/"
+    },
+    "metrics": {
+      "largest_contentful_paint": {
+        "histogramTimeseries": [
+          { "start": 0, "end": 2500, "densities": [0.90, 0.91, 0.89, 0.92, 0.93, 0.94] }
+        ],
+        "percentilesTimeseries": {
+          "p75s": [2600, 2500, 2700, 2400, 2300, 2100]
+        }
+      },
+      "interaction_to_next_paint": {
+        "percentilesTimeseries": {
+          "p75s": [220, 210, null, 190, 180, 170]
+        }
+      },
+      "cumulative_layout_shift": {
+        "percentilesTimeseries": {
+          "p75s": ["0.12", "0.11", "0.10", "0.08", "0.07", "0.05"]
+        }
+      }
+    },
+    "collectionPeriods": [
+      { "firstDate": { "year": 2024, "month": 4, "day": 14 }, "lastDate": { "year": 2024, "month": 5, "day": 11 } },
+      { "firstDate": { "year": 2024, "month": 4, "day": 21 }, "lastDate": { "year": 2024, "month": 5, "day": 18 } },
+      { "firstDate": { "year": 2024, "month": 4, "day": 28 }, "lastDate": { "year": 2024, "month": 5, "day": 25 } },
+      { "firstDate": { "year": 2024, "month": 5, "day": 5 }, "lastDate": { "year": 2024, "month": 6, "day": 1 } },
+      { "firstDate": { "year": 2024, "month": 5, "day": 12 }, "lastDate": { "year": 2024, "month": 6, "day": 8 } },
+      { "firstDate": { "year": 2024, "month": 5, "day": 26 }, "lastDate": { "year": 2024, "month": 6, "day": 22 } }
+    ]
+  }
+}

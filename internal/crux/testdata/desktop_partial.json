@@ -1,0 +1,30 @@
+{
+  "record": {
+    "key": {
+      "formFactor": "DESKTOP",
+      "url": "https://example.com/"
+    },
+    "metrics": {
+      "largest_contentful_paint": {
+        "histogram": [
+          { "start": 0, "end": 2500, "density": 0.9400 },
+          { "start": 2500, "end": 4000, "density": 0.0450 },
+          { "start": 4000, "density": 0.0150 }
+        ],
+        "percentiles": { "p75": 1200 }
+      },
+      "cumulative_layout_shift": {
+        "histogram": [
+          { "start": "0.00", "end": "0.10", "density": 0.9800 },
+          { "start": "0.10", "end": "0.25", "density": 0.0150 },
+          { "start": "0.25", "density": 0.0050 }
+        ],
+        "percentiles": { "p75": "0.01" }
+      }
+    },
+    "collectionPeriod": {
+      "firstDate": { "year": 2024, "month": 5, "day": 26 },
+      "lastDate": { "year": 2024, "month": 6, "day": 22 }
+    }
+  }
+}

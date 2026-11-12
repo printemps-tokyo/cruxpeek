@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,8 +20,8 @@ func TestParseArgsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	if cfg.target != "example.com" {
-		t.Errorf("target: got %q", cfg.target)
+	if len(cfg.targets) != 1 || cfg.targets[0] != "example.com" {
+		t.Errorf("targets: got %q", cfg.targets)
 	}
 	if cfg.device != "all" {
 		t.Errorf("default device: got %q", cfg.device)
@@ -39,7 +40,7 @@ func TestParseArgsHistoryOptionalArg(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	if !cfg.history || cfg.historyWeeks != 12 || cfg.target != "example.com" {
+	if !cfg.history || cfg.historyWeeks != 12 || (len(cfg.targets) != 1 || cfg.targets[0] != "example.com") {
 		t.Errorf("history with weeks parsed wrong: %+v", cfg)
 	}
 
@@ -48,7 +49,7 @@ func TestParseArgsHistoryOptionalArg(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	if !cfg.history || cfg.historyWeeks != 0 || cfg.target != "example.com" {
+	if !cfg.history || cfg.historyWeeks != 0 || (len(cfg.targets) != 1 || cfg.targets[0] != "example.com") {
 		t.Errorf("history without weeks parsed wrong: %+v", cfg)
 	}
 
@@ -83,7 +84,6 @@ func TestParseArgsBadInputs(t *testing.T) {
 		{"--history=99", "example.com"},
 		{"--unknown"},
 		{"--device"},
-		{"a.com", "b.com"},
 	}
 	for _, args := range cases {
 		if _, err := parseArgs(args); err == nil {
@@ -270,5 +270,112 @@ func TestRunHistoryText(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Trend:") {
 		t.Errorf("history output missing trend: %s", out.String())
+	}
+}
+
+// multiServer answers by the url in the request: "slow" gets the poor
+// fixture, "none" a 404 (not enough data), anything else the good fixture.
+func multiServer(t *testing.T) {
+	withTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case strings.Contains(string(body), "slow"):
+			w.Write(fixture(t, "poor_url.json"))
+		case strings.Contains(string(body), "none"):
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":{"code":404,"message":"chrome ux report data not found","status":"NOT_FOUND"}}`))
+		default:
+			w.Write(fixture(t, "good_url.json"))
+		}
+	})
+}
+
+func TestRunComparesSeveralTargets(t *testing.T) {
+	multiServer(t)
+	var out, errb bytes.Buffer
+	code := run([]string{"fast.example", "slow.example", "none.example"}, &out, &errb, "test-key")
+	if code != 1 {
+		t.Fatalf("a breach beats no-data: want 1, got %d (stderr %s)", code, errb.String())
+	}
+	s := out.String()
+	for _, want := range []string{"Comparison", "https://fast.example", "PASS", "FAIL", "NO DATA", "Limits exceeded", "(poor: >"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("comparison missing %q:\n%s", want, s)
+		}
+	}
+
+	out.Reset()
+	code = run([]string{"--json", "fast.example", "none.example"}, &out, &errb, "test-key")
+	if code != 3 {
+		t.Errorf("no breach but no data: want 3, got %d", code)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(out.String()), "[") || !strings.Contains(out.String(), `"exit_code": 3`) {
+		t.Errorf("want a JSON array: %s", out.String())
+	}
+}
+
+func TestRunNotifyJSONListsOnlyBreaches(t *testing.T) {
+	multiServer(t)
+	dir := t.TempDir()
+	list := filepath.Join(dir, "urls.txt")
+	os.WriteFile(list, []byte("# pages\nfast.example\n\nslow.example\nnone.example\n"), 0o600)
+	var out, errb bytes.Buffer
+	code := run([]string{"--from-file", list, "--notify-json"}, &out, &errb, "test-key")
+	if code != 1 {
+		t.Fatalf("want 1, got %d (stderr %s)", code, errb.String())
+	}
+	var alert crux.Alert
+	if err := json.Unmarshal(out.Bytes(), &alert); err != nil {
+		t.Fatalf("bad JSON: %v\n%s", err, out.String())
+	}
+	if alert.Status != "breach" || alert.Checked != 3 || len(alert.NoData) != 1 {
+		t.Errorf("alert: %+v", alert)
+	}
+	for _, b := range alert.Breaches {
+		if b.Identifier != "https://slow.example" {
+			t.Errorf("only the slow page breaches: %+v", b)
+		}
+	}
+	if !strings.Contains(alert.Text, "https://slow.example") || !strings.Contains(alert.Text, "no CrUX data for https://none.example") {
+		t.Errorf("text: %s", alert.Text)
+	}
+
+	out.Reset()
+	code = run([]string{"--notify-json", "fast.example"}, &out, &errb, "test-key")
+	if code != 0 || !strings.Contains(out.String(), `"status": "ok"`) {
+		t.Errorf("all within limits: code %d, %s", code, out.String())
+	}
+}
+
+func TestRunBudgetFailsAGoodPage(t *testing.T) {
+	multiServer(t)
+	var out, errb bytes.Buffer
+	// good_url.json has LCP p75 2100 ms: good officially, over a 2000 ms budget.
+	code := run([]string{"--budget", "lcp=2000,cls=0.2", "fast.example"}, &out, &errb, "test-key")
+	if code != 1 {
+		t.Fatalf("over budget: want 1, got %d (stderr %s)", code, errb.String())
+	}
+	s := out.String()
+	if !strings.Contains(s, "Budgets") || !strings.Contains(s, "OVER (p75 2100 ms)") || !strings.Contains(s, "within") {
+		t.Errorf("budget section: %s", s)
+	}
+}
+
+func TestParseArgsBudgetsAndFiles(t *testing.T) {
+	cfg, err := parseArgs([]string{"--budget=LCP=2000,ttfb=600", "a.com", "b.com", "--from-file", "x.txt", "--notify-json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.budgets[crux.KeyLCP] != 2000 || cfg.budgets[crux.KeyTTFB] != 600 || len(cfg.targets) != 2 || cfg.fromFile != "x.txt" || !cfg.notifyJSON {
+		t.Errorf("cfg: %+v", cfg)
+	}
+	for _, bad := range []string{"lcp", "fid=100", "lcp=-1", "lcp=2000,lcp=1000", ""} {
+		if _, err := parseArgs([]string{"--budget", bad, "a.com"}); err == nil {
+			t.Errorf("budget %q should be rejected", bad)
+		}
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"--history", "a.com", "b.com"}, &out, &errb, "k"); code != 2 {
+		t.Errorf("--history with two URLs: want 2, got %d", code)
 	}
 }

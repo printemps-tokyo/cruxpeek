@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/printemps-tokyo/cruxpeek/internal/crux"
@@ -32,18 +33,25 @@ var newClient = crux.NewClient
 const usage = `cruxpeek - real-user Core Web Vitals from the Chrome UX Report, graded
 
 Usage:
-  cruxpeek [flags] <url>
+  cruxpeek [flags] <url> [<url>...]
 
 The URL may omit its scheme; https:// is assumed when none is given. By
 default cruxpeek queries the exact URL; use --origin for the origin aggregate.
+With several URLs (or --from-file) it prints one comparison table.
 
 Flags:
   --origin            Query the origin-level aggregate, not the exact URL
   --device <d>        Form factor: phone | desktop | tablet | all (default all)
   --metrics <list>    Comma-separated metric keys to restrict the query
   --history [weeks]   Show a p75 trend with a sparkline (weeks 1-40, default 25)
-  --json              Emit structured JSON instead of the text report
+  --json              Emit structured JSON instead of the text report (an
+                      array for several URLs)
   --strict            Also fail (exit 1) when a Core Web Vital needs improvement
+  --budget <list>     Your own p75 limits, e.g. lcp=2000,inp=150,cls=0.08,ttfb=600
+                      (ms; CLS unitless); a metric over its budget fails (exit 1)
+  --from-file <file>  Read URLs from a file, one per line (# comments allowed)
+  --notify-json       Emit only what exceeded a limit, as JSON with a one-line
+                      "text" summary (ready for a chat webhook)
   --timeout <dur>     Per-request timeout (default 15s), e.g. 5s, 1500ms
   --version           Print version and exit
   --help              Show this help and exit
@@ -53,10 +61,11 @@ Authentication:
   enabled. Get one free at https://developer.chrome.com/docs/crux/api (150
   queries/min, no billing required). The key is never printed.
 
-Exit codes:
-  0  no Core Web Vital (LCP, INP, CLS) is "poor" at p75
-  1  a Core Web Vital is "poor" (or, with --strict, "needs improvement")
-  2  invalid arguments, or a missing/invalid API key
+Exit codes (with several URLs, the first that applies: 2, 1, 3, 0):
+  0  no Core Web Vital (LCP, INP, CLS) is "poor" at p75, and no budget is exceeded
+  1  a Core Web Vital is "poor" (or, with --strict, "needs improvement"), or a
+     metric exceeds its --budget
+  2  invalid arguments, a missing/invalid API key, or a failed request
   3  CrUX has not enough real-user data for the url/origin
 
 Examples:
@@ -64,11 +73,16 @@ Examples:
   cruxpeek --origin --device phone example.com
   cruxpeek --history 12 https://example.com/
   cruxpeek --json example.com
+  cruxpeek --origin example.com example.org example.net
+  cruxpeek --from-file urls.txt --budget lcp=2000 --notify-json
 `
 
 // config is the parsed command line.
 type config struct {
-	target       string
+	targets      []string
+	fromFile     string
+	budgets      crux.Budgets
+	notifyJSON   bool
 	origin       bool
 	device       string
 	metrics      []string
@@ -102,8 +116,20 @@ func run(args []string, stdout, stderr io.Writer, apiKey string) int {
 		fmt.Fprintf(stdout, "cruxpeek %s\n", version)
 		return 0
 	}
-	if cfg.target == "" {
+	if cfg.fromFile != "" {
+		lines, ferr := readTargets(cfg.fromFile)
+		if ferr != nil {
+			fmt.Fprintf(stderr, "cruxpeek: %v\n", ferr)
+			return 2
+		}
+		cfg.targets = append(cfg.targets, lines...)
+	}
+	if len(cfg.targets) == 0 {
 		fmt.Fprintf(stderr, "cruxpeek: missing <url>\n\nRun 'cruxpeek --help' for usage.\n")
+		return 2
+	}
+	if cfg.history && (len(cfg.targets) > 1 || cfg.notifyJSON) {
+		fmt.Fprintf(stderr, "cruxpeek: --history takes a single URL and no --notify-json\n")
 		return 2
 	}
 
@@ -113,21 +139,14 @@ func run(args []string, stdout, stderr io.Writer, apiKey string) int {
 		return 2
 	}
 
-	req := crux.QueryRequest{FormFactor: formFactor, Metrics: cfg.metrics}
-	if cfg.origin {
-		origin, oerr := crux.OriginOf(cfg.target)
-		if oerr != nil {
-			fmt.Fprintf(stderr, "cruxpeek: %v\n", oerr)
+	reqs := make([]crux.QueryRequest, 0, len(cfg.targets))
+	for _, target := range cfg.targets {
+		req, rerr := buildRequest(target, cfg, formFactor)
+		if rerr != nil {
+			fmt.Fprintf(stderr, "cruxpeek: %v\n", rerr)
 			return 2
 		}
-		req.Origin = origin
-	} else {
-		u, uerr := crux.NormalizeURL(cfg.target)
-		if uerr != nil {
-			fmt.Fprintf(stderr, "cruxpeek: %v\n", uerr)
-			return 2
-		}
-		req.URL = u
+		reqs = append(reqs, req)
 	}
 
 	if strings.TrimSpace(apiKey) == "" {
@@ -136,13 +155,216 @@ func run(args []string, stdout, stderr io.Writer, apiKey string) int {
 	}
 
 	client := newClient(apiKey, cfg.timeout)
+
+	if len(reqs) > 1 || cfg.notifyJSON {
+		return runMany(client, reqs, cfg, stdout, stderr)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout+5*time.Second)
 	defer cancel()
-
 	if cfg.history {
-		return runHistory(ctx, client, req, cfg, stdout, stderr)
+		return runHistory(ctx, client, reqs[0], cfg, stdout, stderr)
 	}
-	return runRecord(ctx, client, req, cfg, stdout, stderr)
+	return runRecord(ctx, client, reqs[0], cfg, stdout, stderr)
+}
+
+// buildRequest turns one command-line target into a CrUX query.
+func buildRequest(target string, cfg config, formFactor string) (crux.QueryRequest, error) {
+	req := crux.QueryRequest{FormFactor: formFactor, Metrics: cfg.metrics}
+	if cfg.origin {
+		origin, err := crux.OriginOf(target)
+		if err != nil {
+			return req, err
+		}
+		req.Origin = origin
+		return req, nil
+	}
+	u, err := crux.NormalizeURL(target)
+	if err != nil {
+		return req, err
+	}
+	req.URL = u
+	return req, nil
+}
+
+// readTargets reads one url per line, skipping blanks and # comments.
+func readTargets(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s lists no URLs", path)
+	}
+	return out, nil
+}
+
+// outcome is one target's result in a multi-target run.
+type outcome struct {
+	req      crux.QueryRequest
+	report   *crux.Report
+	breaches []crux.Breach
+	noData   bool
+	err      error
+}
+
+// runMany queries every target in order (sequentially, to stay well inside
+// the API's per-minute quota) and prints a comparison, a JSON array, or the
+// notification document.
+func runMany(client *crux.Client, reqs []crux.QueryRequest, cfg config, stdout, stderr io.Writer) int {
+	outcomes := make([]outcome, 0, len(reqs))
+	for _, req := range reqs {
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout+5*time.Second)
+		rec, err := client.QueryRecord(ctx, req)
+		cancel()
+		o := outcome{req: req}
+		switch {
+		case errors.Is(err, crux.ErrInsufficientData):
+			o.noData = true
+		case err != nil:
+			o.err = err
+		default:
+			o.report = crux.BuildReport(req, rec)
+			o.breaches = o.report.Breaches(cfg.strict, cfg.budgets)
+		}
+		outcomes = append(outcomes, o)
+		var authErr *crux.AuthError
+		if errors.As(err, &authErr) {
+			// The same key serves every query; stop instead of repeating it.
+			fmt.Fprintf(stderr, "cruxpeek: %v\n", authErr)
+			fmt.Fprintf(stderr, "  Check that CRUX_API_KEY is a valid key with the \"Chrome UX Report API\" enabled.\n")
+			return 2
+		}
+	}
+
+	code := 0
+	var breaches []crux.Breach
+	var noData, errs []string
+	for _, o := range outcomes {
+		switch {
+		case o.err != nil:
+			errs = append(errs, fmt.Sprintf("%s: %v", o.req.Identifier(), o.err))
+		case o.noData:
+			noData = append(noData, o.req.Identifier())
+		default:
+			breaches = append(breaches, o.breaches...)
+		}
+	}
+	switch {
+	case len(errs) > 0:
+		code = 2
+	case len(breaches) > 0:
+		code = 1
+	case len(noData) > 0:
+		code = 3
+	}
+
+	switch {
+	case cfg.notifyJSON:
+		if err := writeJSON(stdout, crux.BuildAlert(len(outcomes), breaches, noData, errs)); err != nil {
+			fmt.Fprintf(stderr, "cruxpeek: %v\n", err)
+			return 2
+		}
+	case cfg.jsonOut:
+		items := make([]any, 0, len(outcomes))
+		for _, o := range outcomes {
+			switch {
+			case o.report != nil:
+				j := o.report.ToJSON(cfg.strict)
+				j.ExitCode = 0
+				if len(o.breaches) > 0 {
+					j.ExitCode = 1
+				}
+				items = append(items, j)
+			case o.noData:
+				items = append(items, map[string]any{"identifier": o.req.Identifier(), "error": "not enough real-user data", "exit_code": 3})
+			default:
+				items = append(items, map[string]any{"identifier": o.req.Identifier(), "error": o.err.Error(), "exit_code": 2})
+			}
+		}
+		if err := writeJSON(stdout, items); err != nil {
+			fmt.Fprintf(stderr, "cruxpeek: %v\n", err)
+			return 2
+		}
+	default:
+		writeComparison(stdout, outcomes, cfg)
+	}
+	return code
+}
+
+// writeComparison renders one row per target and the limits each exceeded.
+func writeComparison(w io.Writer, outcomes []outcome, cfg config) {
+	scope := "url"
+	if cfg.origin {
+		scope = "origin"
+	}
+	ff := ""
+	if len(outcomes) > 0 {
+		ff = crux.FormFactorLabel(outcomes[0].req.FormFactor)
+	}
+	fmt.Fprintf(w, "Comparison (%s, %s)\n\n", scope, ff)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	header := "  #\tTarget"
+	for _, d := range crux.MetricDefs {
+		header += "\t" + d.Label
+	}
+	fmt.Fprintln(tw, header+"\tResult")
+	for i, o := range outcomes {
+		row := fmt.Sprintf("  %d\t%s", i+1, o.req.Identifier())
+		switch {
+		case o.report != nil:
+			for _, m := range o.report.Metrics {
+				row += "\t" + cell(m)
+			}
+			if len(o.breaches) > 0 {
+				row += "\tFAIL"
+			} else {
+				row += "\tPASS"
+			}
+		case o.noData:
+			row += strings.Repeat("\t-", len(crux.MetricDefs)) + "\tNO DATA"
+		default:
+			row += strings.Repeat("\t-", len(crux.MetricDefs)) + "\tERROR"
+		}
+		fmt.Fprintln(tw, row)
+	}
+	tw.Flush()
+
+	var lines []string
+	for _, o := range outcomes {
+		for _, b := range o.breaches {
+			lines = append(lines, fmt.Sprintf("  %s  %s", o.req.Identifier(), b.Describe()))
+		}
+		if o.err != nil {
+			lines = append(lines, fmt.Sprintf("  %s  error: %v", o.req.Identifier(), o.err))
+		}
+	}
+	fmt.Fprintln(w)
+	if len(lines) == 0 {
+		fmt.Fprintln(w, "Limits: none exceeded")
+		return
+	}
+	fmt.Fprintln(w, "Limits exceeded")
+	for _, l := range lines {
+		fmt.Fprintln(w, l)
+	}
+}
+
+// cell is a compact metric value plus its rating, e.g. "2100 ms good".
+func cell(m crux.MetricReport) string {
+	if !m.Present {
+		return "-"
+	}
+	rating := map[crux.Assessment]string{crux.Good: "good", crux.NeedsImprovement: "ni", crux.Poor: "POOR"}[m.Assessment]
+	return m.Def.FormatValue(m.P75) + " " + rating
 }
 
 func runRecord(ctx context.Context, client *crux.Client, req crux.QueryRequest, cfg config, stdout, stderr io.Writer) int {
@@ -151,15 +373,23 @@ func runRecord(ctx context.Context, client *crux.Client, req crux.QueryRequest, 
 		return handleQueryError(err, req, stderr)
 	}
 	report := crux.BuildReport(req, rec)
+	breaches := report.Breaches(cfg.strict, cfg.budgets)
+	code := 0
+	if len(breaches) > 0 {
+		code = 1
+	}
 	if cfg.jsonOut {
-		if err := writeJSON(stdout, report.ToJSON(cfg.strict)); err != nil {
+		j := report.ToJSON(cfg.strict)
+		j.ExitCode = code
+		if err := writeJSON(stdout, j); err != nil {
 			fmt.Fprintf(stderr, "cruxpeek: %v\n", err)
 			return 2
 		}
 	} else {
 		writeReport(stdout, report, cfg.strict)
+		writeBudgets(stdout, report, breaches, cfg.budgets)
 	}
-	return report.ExitCode(cfg.strict)
+	return code
 }
 
 func runHistory(ctx context.Context, client *crux.Client, req crux.QueryRequest, cfg config, stdout, stderr io.Writer) int {
@@ -237,6 +467,24 @@ func parseArgs(args []string) (config, error) {
 			cfg.strict = true
 		case arg == "--origin":
 			cfg.origin = true
+		case arg == "--notify-json":
+			cfg.notifyJSON = true
+		case arg == "--budget" || strings.HasPrefix(arg, "--budget="):
+			v, err := valueFor(arg, &i, args, "--budget")
+			if err != nil {
+				return cfg, err
+			}
+			b, berr := crux.ParseBudgets(v)
+			if berr != nil {
+				return cfg, berr
+			}
+			cfg.budgets = b
+		case arg == "--from-file" || strings.HasPrefix(arg, "--from-file="):
+			v, err := valueFor(arg, &i, args, "--from-file")
+			if err != nil {
+				return cfg, err
+			}
+			cfg.fromFile = v
 		case arg == "--history":
 			cfg.history = true
 			// Optional numeric argument: only consumed if the next token parses
@@ -289,10 +537,7 @@ func parseArgs(args []string) (config, error) {
 		case strings.HasPrefix(arg, "-") && arg != "-":
 			return cfg, fmt.Errorf("unknown flag %q", arg)
 		default:
-			if cfg.target != "" {
-				return cfg, fmt.Errorf("unexpected extra argument %q", arg)
-			}
-			cfg.target = arg
+			cfg.targets = append(cfg.targets, arg)
 		}
 	}
 	return cfg, nil
@@ -379,6 +624,40 @@ func writeReport(w io.Writer, r *crux.Report, strict bool) {
 			what = "poor or needs-improvement"
 		}
 		fmt.Fprintf(w, "Assessment: FAIL (a Core Web Vital is %s at p75)\n", what)
+	}
+}
+
+// writeBudgets adds the --budget verdicts under the single-target report.
+func writeBudgets(w io.Writer, r *crux.Report, breaches []crux.Breach, budgets crux.Budgets) {
+	if len(budgets) == 0 {
+		return
+	}
+	over := map[string]bool{}
+	for _, b := range breaches {
+		if b.Rule == "budget" {
+			over[b.Key] = true
+		}
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Budgets")
+	for _, m := range r.Metrics {
+		limit, ok := budgets[m.Def.Key]
+		if !ok {
+			continue
+		}
+		switch {
+		case !m.Present:
+			fmt.Fprintf(w, "  %-5s budget %-10s  no data\n", m.Def.Label, m.Def.FormatValue(limit))
+		case over[m.Def.Key]:
+			fmt.Fprintf(w, "  %-5s budget %-10s  OVER (p75 %s)\n", m.Def.Label, m.Def.FormatValue(limit), m.Def.FormatValue(m.P75))
+		case m.P75 > limit:
+			fmt.Fprintf(w, "  %-5s budget %-10s  over, already counted above (p75 %s)\n", m.Def.Label, m.Def.FormatValue(limit), m.Def.FormatValue(m.P75))
+		default:
+			fmt.Fprintf(w, "  %-5s budget %-10s  within (p75 %s)\n", m.Def.Label, m.Def.FormatValue(limit), m.Def.FormatValue(m.P75))
+		}
+	}
+	if len(over) > 0 {
+		fmt.Fprintln(w, "Assessment: FAIL (over budget)")
 	}
 }
 

@@ -139,16 +139,84 @@ Trend: 2024-05-11 to 2024-06-22 (6 weeks)
 A blank in the sparkline is a week for which CrUX had no data. Pass a number
 (1-40) to choose how many weeks to request; the API default is 25.
 
+## Several URLs at once
+
+Give several URLs (or `--from-file urls.txt`, one per line, `#` comments
+allowed) and cruxpeek queries them one after another and prints one table:
+
+```text
+Comparison (url, All form factors)
+
+  #  Target                LCP           INP          CLS        FCP           TTFB          Result
+  1  https://fast.example  2100 ms good  150 ms good  0.05 good  1500 ms good  600 ms good   PASS
+  2  https://slow.example  5000 ms POOR  600 ms POOR  0.30 POOR  3200 ms POOR  2000 ms POOR  FAIL
+  3  https://none.example  -             -            -          -             -             NO DATA
+
+Limits exceeded
+  https://slow.example  LCP p75 5000 ms (poor: > 4000 ms)
+  https://slow.example  INP p75 600 ms (poor: > 500 ms)
+  https://slow.example  CLS p75 0.30 (poor: > 0.25)
+```
+
+(Values from the test fixtures.) `--json` prints an array with one report per
+URL; a URL without data or with a failed request appears as
+`{"identifier", "error", "exit_code"}`. Queries run sequentially, which keeps
+a long list well inside the API's per-minute quota.
+
+## Budgets
+
+`--budget lcp=2000,inp=150,cls=0.08,ttfb=600` sets your own p75 ceilings (ms;
+CLS unitless), for any of the five metrics. A metric whose p75 is over its
+budget fails the run (exit 1) even when the official assessment is good. A Core
+Web Vital that is already poor (or, with `--strict`, needs improvement) is
+reported once, under the official rule. The single-URL report adds a
+"Budgets" section with each budget's verdict.
+
+## Notification JSON
+
+`--notify-json` prints only what crossed a limit, in a small document meant for
+cron jobs and chat webhooks:
+
+```json
+{
+  "status": "breach",
+  "checked": 3,
+  "breaches": [
+    {
+      "identifier": "https://slow.example",
+      "metric": "LCP",
+      "key": "largest_contentful_paint",
+      "p75": 5000,
+      "unit": "ms",
+      "assessment": "poor",
+      "rule": "poor",
+      "limit": 4000
+    }
+  ],
+  "no_data": ["https://none.example"],
+  "errors": [],
+  "text": "cruxpeek: 3 limit(s) exceeded across 3 targets. https://slow.example: LCP p75 5000 ms (poor: > 4000 ms), ... (no CrUX data for https://none.example)"
+}
+```
+
+`status` is `ok`, `breach`, or `error`; `rule` is `poor`, `needs-improvement`
+(under `--strict`) or `budget`, and `limit` is the threshold or budget that was
+exceeded. `text` is a one-line summary in the field a Slack incoming webhook
+reads, so the document can be posted to one as it is. cruxpeek itself never
+sends anything anywhere but the CrUX API.
+
 ## Exit-code contract
 
-cruxpeek is designed for CI. Only the three Core Web Vitals (LCP, INP, CLS)
-influence the exit code; FCP and TTFB are reported but never fail a build.
+cruxpeek is designed for CI. Of the official assessments, only the three Core
+Web Vitals (LCP, INP, CLS) influence the exit code; FCP and TTFB fail a build
+only through a `--budget` you set. With several URLs, the code is the first
+that applies of 2, 1, 3, 0.
 
 | Exit | Meaning |
 | ---- | ------- |
-| 0 | No Core Web Vital is poor at p75 (and, with `--strict`, none needs improvement). |
-| 1 | A Core Web Vital is poor at p75, or with `--strict` also when one needs improvement. |
-| 2 | Invalid arguments, or a missing/invalid API key. |
+| 0 | No Core Web Vital is poor at p75 (and, with `--strict`, none needs improvement), and no metric is over its `--budget`. |
+| 1 | A Core Web Vital is poor at p75, or with `--strict` also when one needs improvement, or a metric is over its `--budget`. |
+| 2 | Invalid arguments, a missing/invalid API key, or (with several URLs) a failed request. |
 | 3 | CrUX has not enough real-user data for the url/origin (the API returned 404). |
 
 Example CI gate:
@@ -160,14 +228,18 @@ cruxpeek --strict https://example.com/ || echo "Core Web Vitals regressed"
 ## Options
 
 ```text
-cruxpeek [flags] <url>
+cruxpeek [flags] <url> [<url>...]
 
   --origin            Query the origin-level aggregate, not the exact URL
   --device <d>        Form factor: phone | desktop | tablet | all (default all)
   --metrics <list>    Comma-separated CrUX metric keys to restrict the query
   --history [weeks]   Show a p75 trend with a sparkline (weeks 1-40, default 25)
-  --json              Emit structured JSON instead of the text report
+  --json              Emit structured JSON instead of the text report (an
+                      array for several URLs)
   --strict            Also fail (exit 1) when a Core Web Vital needs improvement
+  --budget <list>     Your own p75 limits, e.g. lcp=2000,inp=150,cls=0.08,ttfb=600
+  --from-file <file>  Read URLs from a file, one per line (# comments allowed)
+  --notify-json       Emit only what exceeded a limit, with a one-line "text"
   --timeout <dur>     Per-request timeout (default 15s), e.g. 5s, 1500ms
   --version           Print version and exit
   --help              Show this help and exit
